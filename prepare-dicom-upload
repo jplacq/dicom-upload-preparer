@@ -1,0 +1,1448 @@
+#!/usr/bin/env python3
+
+import argparse
+import csv
+import hashlib
+import re
+import shutil
+import sys
+import zipfile
+from collections import defaultdict
+from pathlib import Path
+
+
+# ============================================================
+# PYDICOM
+# ============================================================
+
+try:
+    import pydicom
+except ImportError:
+    candidate = Path.home() / ".venvs" / "dicom-tools" / "lib"
+
+    for p in candidate.glob("python*/site-packages"):
+        sys.path.insert(0, str(p))
+
+    try:
+        import pydicom
+    except ImportError:
+        print(
+            "\npydicom n'est pas installé.\n\n"
+            "Installation recommandée :\n"
+            "  python3 -m venv ~/.venvs/dicom-tools\n"
+            "  ~/.venvs/dicom-tools/bin/pip install pydicom\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+MAX_ZIP_MB_DEFAULT = 430
+
+
+# ============================================================
+# PRIORITÉS
+# ============================================================
+
+PRIORITY = {
+
+    # Structures / annotations
+    "RTSTRUCT": 120,
+    "SEG": 120,
+
+    # IRM
+    "ADC": 110,
+    "DWI": 110,
+    "DCE": 105,
+    "PERFUSION": 105,
+    "T2": 100,
+    "FLAIR": 100,
+    "T1": 95,
+    "SWI": 95,
+    "STIR": 90,
+    "MRA": 90,
+    "MRV": 90,
+    "TOF": 90,
+
+    # CT / TDM
+    "CT_ABDOMEN_PELVIS_C_THIN": 110,
+    "CT_THORAX_C_THIN": 110,
+    "CT_LUNG_THIN": 108,
+
+    "CT_ABDOMEN_PELVIS_C": 105,
+    "CT_THORAX_C": 105,
+    "CT_LUNG": 102,
+
+    "CT_ABDOMEN_PELVIS_NC": 95,
+    "CT_THORAX_NC": 95,
+
+    "CT_MPR_CORONAL": 85,
+    "CT_MPR_SAGITTAL": 85,
+
+    "CT_MIP": 70,
+
+    # Divers
+    "SR": 40,
+    "DOSE_REPORT": 10,
+    "LOCALIZER": 5,
+    "OTHER": 50,
+}
+
+
+# ============================================================
+# IRM
+# ============================================================
+
+MRI_RULES = [
+
+    ("ADC", [
+        r"\badc\b",
+        r"apparent.?diffusion",
+    ]),
+
+    ("DWI", [
+        r"\bdwi\b",
+        r"\bdiff\b",
+        r"diffusion",
+        r"\beadc\b",
+        r"\bb[0-9]{2,4}\b",
+    ]),
+
+    ("DCE", [
+        r"\bdce\b",
+        r"dynamic",
+        r"\bdyn\b",
+        r"disco",
+        r"post.?contrast",
+        r"lava",
+        r"vibe",
+        r"thrive",
+    ]),
+
+    ("FLAIR", [
+        r"flair",
+    ]),
+
+    ("STIR", [
+        r"\bstir\b",
+    ]),
+
+    ("SWI", [
+        r"\bswi\b",
+        r"susceptibility",
+    ]),
+
+    ("T2", [
+        r"\bt2\b",
+        r"t2w",
+        r"cube.?t2",
+        r"space.?t2",
+    ]),
+
+    ("T1", [
+        r"\bt1\b",
+        r"t1w",
+        r"mprage",
+        r"spgr",
+    ]),
+
+    ("PERFUSION", [
+        r"perfusion",
+        r"\bpwi\b",
+        r"\bdsc\b",
+        r"\basl\b",
+    ]),
+
+    ("TOF", [
+        r"\btof\b",
+    ]),
+
+    ("MRA", [
+        r"\bmra\b",
+        r"angiograph",
+    ]),
+
+    ("MRV", [
+        r"\bmrv\b",
+        r"venograph",
+    ]),
+]
+
+
+# ============================================================
+# IDENTIFIANTS À SUPPRIMER
+# ============================================================
+
+PHI_FIELDS = [
+
+    "PatientName",
+    "PatientID",
+    "IssuerOfPatientID",
+
+    "PatientBirthDate",
+    "PatientBirthTime",
+    "PatientSex",
+    "PatientAge",
+
+    "PatientAddress",
+    "PatientTelephoneNumbers",
+
+    "OtherPatientIDs",
+    "OtherPatientNames",
+
+    "Occupation",
+    "AdditionalPatientHistory",
+
+    "ReferringPhysicianName",
+    "PerformingPhysicianName",
+    "OperatorsName",
+
+    "PhysiciansOfRecord",
+    "NameOfPhysiciansReadingStudy",
+
+    "RequestingPhysician",
+
+    "InstitutionAddress",
+    "InstitutionalDepartmentName",
+
+    "AccessionNumber",
+    "AdmissionID",
+    "StudyID",
+]
+
+
+# ============================================================
+# UTILITAIRES
+# ============================================================
+
+def get(ds, attr, default=""):
+    try:
+        value = getattr(ds, attr, default)
+
+        if value is None:
+            return default
+
+        return str(value)
+
+    except Exception:
+        return default
+
+
+def clean_filename(text, maxlen=110):
+
+    text = str(text or "").strip()
+
+    if not text:
+        return "Unnamed"
+
+    text = re.sub(
+        r"[^\w.\-+ ]+",
+        "_",
+        text,
+        flags=re.UNICODE,
+    )
+
+    text = re.sub(
+        r"\s+",
+        "_",
+        text,
+    )
+
+    return text[:maxlen].strip("_")
+
+
+def hash_uid(uid):
+
+    return hashlib.sha1(
+        uid.encode("utf-8")
+    ).hexdigest()[:10]
+
+
+# ============================================================
+# ORIENTATION
+# ============================================================
+
+def cross(a, b):
+
+    return [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+
+
+def dot(a, b):
+
+    return (
+        a[0] * b[0]
+        + a[1] * b[1]
+        + a[2] * b[2]
+    )
+
+
+def detect_plane(ds):
+
+    text = " ".join([
+        get(ds, "SeriesDescription"),
+        get(ds, "ProtocolName"),
+    ]).lower()
+
+    if re.search(
+        r"\b(ax|axi|axial|trans|tra)\b",
+        text,
+    ):
+        return "AXIAL"
+
+    if re.search(
+        r"\b(cor|coro|coronal)\b",
+        text,
+    ):
+        return "CORONAL"
+
+    if re.search(
+        r"\b(sag|sagittal)\b",
+        text,
+    ):
+        return "SAGITTAL"
+
+    try:
+
+        orientation = [
+            float(x)
+            for x in ds.ImageOrientationPatient
+        ]
+
+        row = orientation[:3]
+        col = orientation[3:]
+
+        normal = cross(
+            row,
+            col,
+        )
+
+        absolute = [
+            abs(x)
+            for x in normal
+        ]
+
+        idx = absolute.index(
+            max(absolute)
+        )
+
+        if idx == 2:
+            return "AXIAL"
+
+        if idx == 1:
+            return "CORONAL"
+
+        if idx == 0:
+            return "SAGITTAL"
+
+    except Exception:
+        pass
+
+    return "UNKNOWN"
+
+
+# ============================================================
+# TRI ANATOMIQUE
+# ============================================================
+
+def anatomical_position(ds):
+
+    try:
+
+        orientation = [
+            float(x)
+            for x in ds.ImageOrientationPatient
+        ]
+
+        position = [
+            float(x)
+            for x in ds.ImagePositionPatient
+        ]
+
+        row = orientation[:3]
+        col = orientation[3:]
+
+        normal = cross(
+            row,
+            col,
+        )
+
+        return dot(
+            position,
+            normal,
+        )
+
+    except Exception:
+        return None
+
+
+def get_instance(ds):
+
+    try:
+        return int(ds.InstanceNumber)
+
+    except Exception:
+        return None
+
+
+def get_temporal(ds):
+
+    for attr in [
+        "TemporalPositionIdentifier",
+        "AcquisitionNumber",
+    ]:
+
+        try:
+            return int(
+                getattr(ds, attr)
+            )
+
+        except Exception:
+            pass
+
+    return 0
+
+
+def sort_key(item):
+
+    path, meta = item
+
+    temporal = meta["temporal"]
+
+    position = meta["position"]
+
+    instance = meta["instance"]
+
+    if position is not None:
+
+        return (
+            temporal,
+            0,
+            position,
+            instance
+                if instance is not None
+                else 999999,
+            path.name,
+        )
+
+    if instance is not None:
+
+        return (
+            temporal,
+            1,
+            instance,
+            path.name,
+        )
+
+    return (
+        temporal,
+        2,
+        path.name,
+    )
+
+
+# ============================================================
+# STRUCTURES DICOM
+# ============================================================
+
+def special_object(ds):
+
+    modality = get(
+        ds,
+        "Modality",
+    ).upper()
+
+    if modality == "RTSTRUCT":
+        return "RTSTRUCT"
+
+    if modality == "SEG":
+        return "SEG"
+
+    if modality == "SR":
+
+        text = get(
+            ds,
+            "SeriesDescription",
+        ).lower()
+
+        if "dose" in text:
+            return "DOSE_REPORT"
+
+        return "SR"
+
+    return None
+
+
+# ============================================================
+# IRM CLASSIFICATION
+# ============================================================
+
+def classify_mri(ds):
+
+    text = " ".join([
+        get(ds, "SeriesDescription"),
+        get(ds, "ProtocolName"),
+        get(ds, "SequenceName"),
+        get(ds, "ScanningSequence"),
+        get(ds, "SequenceVariant"),
+        get(ds, "ImageType"),
+    ]).lower()
+
+    for label, patterns in MRI_RULES:
+
+        for pattern in patterns:
+
+            if re.search(
+                pattern,
+                text,
+                flags=re.I,
+            ):
+                return label
+
+    return "OTHER"
+
+
+# ============================================================
+# CT / TDM CLASSIFICATION
+# ============================================================
+
+def ct_is_contrast(ds, text):
+
+    # Description explicite
+
+    if re.search(
+        r"\+c\b|with.?contrast|contrast|inject",
+        text,
+        flags=re.I,
+    ):
+        return True
+
+    if re.search(
+        r"\-c\b|without.?contrast|non.?contrast|sans.?contraste",
+        text,
+        flags=re.I,
+    ):
+        return False
+
+    # Métadonnée DICOM
+
+    agent = get(
+        ds,
+        "ContrastBolusAgent",
+    )
+
+    if agent.strip():
+        return True
+
+    return None
+
+
+def ct_slice_thickness(ds):
+
+    try:
+        return float(
+            ds.SliceThickness
+        )
+
+    except Exception:
+        return None
+
+
+def classify_ct(ds):
+
+    text = " ".join([
+        get(ds, "SeriesDescription"),
+        get(ds, "ProtocolName"),
+        get(ds, "BodyPartExamined"),
+        get(ds, "ImageType"),
+        get(ds, "ConvolutionKernel"),
+    ]).lower()
+
+    plane = detect_plane(ds)
+
+    thickness = ct_slice_thickness(ds)
+
+    contrast = ct_is_contrast(
+        ds,
+        text,
+    )
+
+    # Localizer
+
+    if re.search(
+        r"topogram|localizer|scout|survey",
+        text,
+    ):
+        return "LOCALIZER"
+
+    # MIP
+
+    if re.search(
+        r"\bmip\b|max.?intensity",
+        text,
+    ):
+        return "CT_MIP"
+
+    # Reconstructions multiplanaires
+
+    if plane == "CORONAL":
+
+        if re.search(
+            r"\bmpr\b|reformat|recon",
+            text,
+        ):
+            return "CT_MPR_CORONAL"
+
+    if plane == "SAGITTAL":
+
+        if re.search(
+            r"\bmpr\b|reformat|recon",
+            text,
+        ):
+            return "CT_MPR_SAGITTAL"
+
+    # Fenêtre pulmonaire
+
+    lung = bool(
+        re.search(
+            r"pulm|lung|br5[0-9]|b7[0-9]",
+            text,
+        )
+    )
+
+    # Thorax
+
+    thorax = bool(
+        re.search(
+            r"thorax|chest|lung|pulm",
+            text,
+        )
+    )
+
+    # Abdomen / pelvis
+
+    abdomen = bool(
+        re.search(
+            r"abdomen|abdo|pelvis|pelv|tap|abdopelv",
+            text,
+        )
+    )
+
+    thin = (
+        thickness is not None
+        and thickness <= 1.5
+    )
+
+    if lung and thin:
+        return "CT_LUNG_THIN"
+
+    if lung:
+        return "CT_LUNG"
+
+    if thorax:
+
+        if contrast is False:
+
+            return "CT_THORAX_NC"
+
+        if thin:
+
+            return "CT_THORAX_C_THIN"
+
+        return "CT_THORAX_C"
+
+    if abdomen:
+
+        if contrast is False:
+
+            return "CT_ABDOMEN_PELVIS_NC"
+
+        if thin:
+
+            return "CT_ABDOMEN_PELVIS_C_THIN"
+
+        return "CT_ABDOMEN_PELVIS_C"
+
+    return "OTHER"
+
+
+# ============================================================
+# CLASSIFICATION GLOBALE
+# ============================================================
+
+def classify(ds):
+
+    special = special_object(ds)
+
+    if special:
+        return special
+
+    modality = get(
+        ds,
+        "Modality",
+    ).upper()
+
+    if modality == "MR":
+        return classify_mri(ds)
+
+    if modality == "CT":
+        return classify_ct(ds)
+
+    return "OTHER"
+
+
+# ============================================================
+# ANONYMISATION
+# ============================================================
+
+def anonymize_dataset(ds):
+
+    # Supprime tous les tags privés
+    try:
+        ds.remove_private_tags()
+    except Exception:
+        pass
+
+    for attr in PHI_FIELDS:
+
+        if hasattr(ds, attr):
+
+            try:
+                setattr(
+                    ds,
+                    attr,
+                    "",
+                )
+            except Exception:
+                pass
+
+    # Identité neutre
+    try:
+        ds.PatientName = "ANONYMOUS"
+    except Exception:
+        pass
+
+    try:
+        ds.PatientID = "ANONYMOUS"
+    except Exception:
+        pass
+
+    # Important :
+    # on conserve les UID afin de garder les relations
+    # RTSTRUCT / SEG / SR / séries.
+
+    return ds
+
+
+def write_dicom(
+    src,
+    dst,
+    anonymize,
+):
+
+    dst.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    if not anonymize:
+
+        shutil.copy2(
+            src,
+            dst,
+        )
+
+        return
+
+    ds = pydicom.dcmread(
+        str(src),
+        force=True,
+    )
+
+    anonymize_dataset(ds)
+
+    ds.save_as(
+        str(dst),
+        enforce_file_format=True,
+    )
+
+
+# ============================================================
+# ZIP
+# ============================================================
+
+def split_files(
+    files,
+    max_bytes,
+):
+
+    groups = []
+
+    current = []
+    size = 0
+
+    for f in files:
+
+        try:
+            current_size = f.stat().st_size
+        except Exception:
+            current_size = 0
+
+        if (
+            current
+            and size + current_size > max_bytes
+        ):
+
+            groups.append(
+                current
+            )
+
+            current = []
+            size = 0
+
+        current.append(
+            f
+        )
+
+        size += current_size
+
+    if current:
+
+        groups.append(
+            current
+        )
+
+    return groups
+
+
+def make_zip(
+    zip_path,
+    base_dir,
+    files,
+):
+
+    with zipfile.ZipFile(
+        zip_path,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=6,
+    ) as archive:
+
+        for f in files:
+
+            archive.write(
+                f,
+                f.relative_to(base_dir),
+            )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Prépare une étude DICOM IRM ou CT/TDM "
+            "pour analyse et partage."
+        )
+    )
+
+    parser.add_argument(
+        "source",
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="dicom_upload",
+    )
+
+    parser.add_argument(
+        "--anonymize",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--max-zip-mb",
+        type=int,
+        default=MAX_ZIP_MB_DEFAULT,
+    )
+
+    parser.add_argument(
+        "--no-zip",
+        action="store_true",
+    )
+
+    args = parser.parse_args()
+
+    source = (
+        Path(args.source)
+        .expanduser()
+        .resolve()
+    )
+
+    output = (
+        Path(args.output)
+        .expanduser()
+        .resolve()
+    )
+
+    if not source.exists():
+
+        print(
+            f"Source inexistante : {source}",
+            file=sys.stderr,
+        )
+
+        sys.exit(1)
+
+    series_root = (
+        output
+        / "series"
+    )
+
+    zip_root = (
+        output
+        / "zip"
+    )
+
+    series_root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    zip_root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    print()
+    print("DICOM UPLOAD PREPARATION v3")
+    print("===========================")
+    print()
+    print(source)
+    print()
+
+    series = defaultdict(
+        lambda: {
+            "items": [],
+        }
+    )
+
+    paths = [
+        p
+        for p in source.rglob("*")
+        if p.is_file()
+    ]
+
+    total = len(paths)
+
+    for index, path in enumerate(
+        paths,
+        start=1,
+    ):
+
+        if path.name.upper() == "DICOMDIR":
+            continue
+
+        try:
+
+            ds = pydicom.dcmread(
+                str(path),
+                stop_before_pixels=True,
+                force=True,
+            )
+
+        except Exception:
+            continue
+
+        uid = get(
+            ds,
+            "SeriesInstanceUID",
+        )
+
+        if not uid:
+            continue
+
+        item = series[uid]
+
+        item["uid"] = uid
+
+        item["study_uid"] = get(
+            ds,
+            "StudyInstanceUID",
+        )
+
+        item["series_number"] = get(
+            ds,
+            "SeriesNumber",
+        )
+
+        item["description"] = get(
+            ds,
+            "SeriesDescription",
+        )
+
+        item["protocol"] = get(
+            ds,
+            "ProtocolName",
+        )
+
+        item["study"] = get(
+            ds,
+            "StudyDescription",
+        )
+
+        item["date"] = get(
+            ds,
+            "StudyDate",
+        )
+
+        item["modality"] = get(
+            ds,
+            "Modality",
+        )
+
+        item["manufacturer"] = get(
+            ds,
+            "Manufacturer",
+        )
+
+        item["kernel"] = get(
+            ds,
+            "ConvolutionKernel",
+        )
+
+        item["body_part"] = get(
+            ds,
+            "BodyPartExamined",
+        )
+
+        item["slice_thickness"] = get(
+            ds,
+            "SliceThickness",
+        )
+
+        item["contrast_agent"] = get(
+            ds,
+            "ContrastBolusAgent",
+        )
+
+        item["plane"] = detect_plane(
+            ds
+        )
+
+        item["class"] = classify(
+            ds
+        )
+
+        item["rows"] = get(
+            ds,
+            "Rows",
+        )
+
+        item["columns"] = get(
+            ds,
+            "Columns",
+        )
+
+        item["items"].append(
+            (
+                path,
+                {
+                    "position":
+                        anatomical_position(ds),
+
+                    "instance":
+                        get_instance(ds),
+
+                    "temporal":
+                        get_temporal(ds),
+                }
+            )
+        )
+
+        if index % 250 == 0:
+
+            print(
+                f"{index}/{total} fichiers..."
+            )
+
+    print()
+    print(
+        f"{len(series)} séries détectées."
+    )
+    print()
+
+    ordered = sorted(
+        series.values(),
+        key=lambda s: (
+            -PRIORITY.get(
+                s["class"],
+                50,
+            ),
+            int(s["series_number"])
+                if str(s["series_number"]).isdigit()
+                else 99999,
+        ),
+    )
+
+    manifest = []
+
+    for index, s in enumerate(
+        ordered,
+        start=1,
+    ):
+
+        items = sorted(
+            s["items"],
+            key=sort_key,
+        )
+
+        files = [
+            p
+            for p, _
+            in items
+        ]
+
+        total_bytes = sum(
+            p.stat().st_size
+            for p in files
+            if p.exists()
+        )
+
+        size_mb = (
+            total_bytes
+            / 1024
+            / 1024
+        )
+
+        desc = (
+            s["description"]
+            or s["protocol"]
+            or "Unnamed"
+        )
+
+        short_uid = hash_uid(
+            s["uid"]
+        )
+
+        folder_name = clean_filename(
+            f"{index:03d}_"
+            f"{s['class']}_"
+            f"{s['plane']}_"
+            f"S{s['series_number']}_"
+            f"{desc}_"
+            f"{short_uid}"
+        )
+
+        folder = (
+            series_root
+            / folder_name
+        )
+
+        folder.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        print(
+            f"[{index:03d}] "
+            f"{s['class']:28} "
+            f"{s['plane']:10} "
+            f"{len(files):5} "
+            f"{size_mb:7.1f} MB  "
+            f"{desc}"
+        )
+
+        copied = []
+
+        for image_index, src in enumerate(
+            files,
+            start=1,
+        ):
+
+            dst = (
+                folder
+                / f"{image_index:06d}.dcm"
+            )
+
+            write_dicom(
+                src,
+                dst,
+                args.anonymize,
+            )
+
+            copied.append(
+                dst
+            )
+
+        zip_names = []
+
+        if (
+            not args.no_zip
+            and copied
+        ):
+
+            chunks = split_files(
+                copied,
+                args.max_zip_mb
+                * 1024
+                * 1024,
+            )
+
+            for part_no, chunk in enumerate(
+                chunks,
+                start=1,
+            ):
+
+                if len(chunks) == 1:
+
+                    zip_name = (
+                        f"{folder_name}.zip"
+                    )
+
+                else:
+
+                    zip_name = (
+                        f"{folder_name}_"
+                        f"part{part_no:02d}.zip"
+                    )
+
+                zip_path = (
+                    zip_root
+                    / zip_name
+                )
+
+                make_zip(
+                    zip_path,
+                    series_root,
+                    chunk,
+                )
+
+                zip_names.append(
+                    zip_name
+                )
+
+        manifest.append({
+            "priority":
+                PRIORITY.get(
+                    s["class"],
+                    50,
+                ),
+
+            "class":
+                s["class"],
+
+            "modality":
+                s["modality"],
+
+            "plane":
+                s["plane"],
+
+            "series_number":
+                s["series_number"],
+
+            "series_description":
+                s["description"],
+
+            "protocol":
+                s["protocol"],
+
+            "body_part":
+                s["body_part"],
+
+            "slice_thickness":
+                s["slice_thickness"],
+
+            "kernel":
+                s["kernel"],
+
+            "contrast_agent":
+                s["contrast_agent"],
+
+            "images":
+                len(files),
+
+            "size_mb":
+                f"{size_mb:.1f}",
+
+            "rows":
+                s["rows"],
+
+            "columns":
+                s["columns"],
+
+            "folder":
+                folder_name,
+
+            "zip":
+                ";".join(
+                    zip_names
+                ),
+        })
+
+
+    # ========================================================
+    # MANIFEST TSV
+    # ========================================================
+
+    manifest_path = (
+        output
+        / "manifest.tsv"
+    )
+
+    fields = [
+        "priority",
+        "class",
+        "modality",
+        "plane",
+        "series_number",
+        "series_description",
+        "protocol",
+        "body_part",
+        "slice_thickness",
+        "kernel",
+        "contrast_agent",
+        "images",
+        "size_mb",
+        "rows",
+        "columns",
+        "folder",
+        "zip",
+    ]
+
+    with manifest_path.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            delimiter="\t",
+            fieldnames=fields,
+        )
+
+        writer.writeheader()
+
+        writer.writerows(
+            manifest
+        )
+
+
+    # ========================================================
+    # README
+    # ========================================================
+
+    readme = (
+        output
+        / "README.txt"
+    )
+
+    with readme.open(
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        f.write(
+            "DICOM UPLOAD PREPARATION v3\n"
+        )
+
+        f.write(
+            "===========================\n\n"
+        )
+
+        f.write(
+            f"Source : {source}\n"
+        )
+
+        f.write(
+            f"Nombre de séries : {len(manifest)}\n"
+        )
+
+        f.write(
+            "Anonymisation : "
+            f"{'oui' if args.anonymize else 'non'}\n\n"
+        )
+
+        f.write(
+            "SÉRIES PRIORITAIRES\n"
+        )
+
+        f.write(
+            "===================\n\n"
+        )
+
+        for r in manifest:
+
+            if int(
+                r["priority"]
+            ) < 85:
+                continue
+
+            f.write(
+                f"{r['class']:28} "
+                f"{r['plane']:10} "
+                f"S{r['series_number']:>5}  "
+                f"{r['series_description']}  "
+                f"[{r['images']} images / "
+                f"{r['size_mb']} MB]\n"
+            )
+
+            for z in (
+                r["zip"].split(";")
+                if r["zip"]
+                else []
+            ):
+
+                f.write(
+                    f"    ZIP: {z}\n"
+                )
+
+        f.write(
+            "\nAUTRES SÉRIES\n"
+        )
+
+        f.write(
+            "==============\n\n"
+        )
+
+        for r in manifest:
+
+            if int(
+                r["priority"]
+            ) >= 85:
+                continue
+
+            f.write(
+                f"{r['class']:28} "
+                f"{r['plane']:10} "
+                f"S{r['series_number']:>5}  "
+                f"{r['series_description']}  "
+                f"[{r['images']} images / "
+                f"{r['size_mb']} MB]\n"
+            )
+
+
+    print()
+    print("Terminé.")
+    print()
+    print(
+        f"README   : {readme}"
+    )
+    print(
+        f"Manifest : {manifest_path}"
+    )
+    print(
+        f"ZIP      : {zip_root}"
+    )
+    print()
+
+
+if __name__ == "__main__":
+    main()
