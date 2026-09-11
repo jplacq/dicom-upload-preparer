@@ -1,0 +1,100 @@
+name: Build desktop applications
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build dependencies
+        run: python -m pip install --upgrade pip pyinstaller -r requirements.txt
+      - name: Build processing engine
+        run: pyinstaller --clean --noconfirm --onefile --name prepare-dicom-upload prepare-dicom-upload
+      - name: Build graphical application
+        run: pyinstaller --clean --noconfirm --onefile --windowed --name DICOM-Upload-Preparer dicom-upload-preparer-gui.py
+      - name: Assemble Windows package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item dist/DICOM-Upload-Preparer.exe package/
+          Copy-Item dist/prepare-dicom-upload.exe package/
+          Copy-Item README.md package/
+          Compress-Archive -Path package/* -DestinationPath DICOM-Upload-Preparer-Windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DICOM-Upload-Preparer-Windows-x64
+          path: DICOM-Upload-Preparer-Windows-x64.zip
+
+  build-macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build dependencies
+        run: python -m pip install --upgrade pip pyinstaller -r requirements.txt
+      - name: Build processing engine
+        run: pyinstaller --clean --noconfirm --onefile --name prepare-dicom-upload prepare-dicom-upload
+      - name: Build graphical application
+        run: pyinstaller --clean --noconfirm --windowed --name "DICOM Upload Preparer" dicom-upload-preparer-gui.py
+      - name: Put processing engine inside app bundle
+        run: |
+          cp dist/prepare-dicom-upload "dist/DICOM Upload Preparer.app/Contents/MacOS/prepare-dicom-upload"
+          chmod +x "dist/DICOM Upload Preparer.app/Contents/MacOS/prepare-dicom-upload"
+      - name: Create macOS archive
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/DICOM Upload Preparer.app" DICOM-Upload-Preparer-macOS-Apple-Silicon.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DICOM-Upload-Preparer-macOS-Apple-Silicon
+          path: DICOM-Upload-Preparer-macOS-Apple-Silicon.zip
+
+  build-macos-intel:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build dependencies
+        run: python -m pip install --upgrade pip pyinstaller -r requirements.txt
+      - name: Build processing engine
+        run: pyinstaller --clean --noconfirm --onefile --name prepare-dicom-upload prepare-dicom-upload
+      - name: Build graphical application
+        run: pyinstaller --clean --noconfirm --windowed --name "DICOM Upload Preparer" dicom-upload-preparer-gui.py
+      - name: Put processing engine inside app bundle
+        run: |
+          cp dist/prepare-dicom-upload "dist/DICOM Upload Preparer.app/Contents/MacOS/prepare-dicom-upload"
+          chmod +x "dist/DICOM Upload Preparer.app/Contents/MacOS/prepare-dicom-upload"
+      - name: Create macOS archive
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/DICOM Upload Preparer.app" DICOM-Upload-Preparer-macOS-Intel.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DICOM-Upload-Preparer-macOS-Intel
+          path: DICOM-Upload-Preparer-macOS-Intel.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-windows, build-macos-arm64, build-macos-intel]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-files/*.zip
